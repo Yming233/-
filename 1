@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+import os
+import cv2
+import numpy as np
+import torch
+import pandas as pd
+import json
+import re
+import easyocr
+import time
+import requests
+from datetime import datetime, timedelta
+from collections import deque, Counter
+from ultralytics import YOLO
+
+# ========== 新增：DB 写入依赖 ==========
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# ====================== 配置区 ======================
+# 1. 视频流地址
+RTSP_ENTRY = "rtsp://172.30.100.37:1562/rtp/100010018"
+RTSP_EXIT  = "rtsp://172.30.100.37:1562/rtp/100010019"
+
+# 2. 业务系统接收接口 (可为空)
+WEBHOOK_URL = ""
+
+# 3. 算法参数
+MODEL_ENTRY_PATH = "yolov8x.pt"
+MODEL_EXIT_PATH  = "yolov8l-pose.pt"
+CONF_THRES = 0.3
+PROCESS_INTERVAL = 3  # 跳帧加速：每3帧处理1次
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# ====================== 新增：写入开关（默认值） ======================
+# 默认值：都开启（你可按需改成 False）
+DEFAULT_ENABLE_DB_WRITE  = True
+DEFAULT_ENABLE_CSV_WRITE = True
+
+# ====================== 新增：DB 连接配置（建议用环境变量） ======================
+# 优先读取：PG_DSN_73 / PG_DSN_74 / PG_DSN
+DEFAULT_TABLE = "public.security_check_queue"
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """Parse env bool: 1/true/on/yes => True; 0/false/off/no => False."""
+    v = os.environ.get(key, "").strip().lower()
+    if not v:
+        return default
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _build_dsns_from_env():
+    dsns = []
+    for k in ("PG_DSN_73", "PG_DSN_74", "PG_DSN"):
+        v = os.environ.get(k, "").strip()
+        if v:
+            dsns.append(v)
+    return dsns
+
+
+def _connect_any(dsns, timeout=3):
+    last = None
+    for dsn in dsns:
+        try:
+            conn = psycopg2.connect(dsn, connect_timeout=timeout)
+            conn.autocommit = True
+            return conn, dsn
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"connect failed for all DSNs. last_error={last}")
+
+
+# ====================== 百度千帆/BML 纳管模型类 ======================
+
+class PyModel(object):
+    def __init__(self):
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.output_dir = os.path.join(self.base_dir, "output")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # ===== 新增：两个开关（默认从环境变量读取，否则用默认值） =====
+        self.enable_db_write = _env_bool("ENABLE_DB_WRITE", DEFAULT_ENABLE_DB_WRITE)
+        self.enable_csv_write = _env_bool("ENABLE_CSV_WRITE", DEFAULT_ENABLE_CSV_WRITE)
+
+        # ===== 新增：DB DSN 列表（从环境变量读取） =====
+        self.pg_dsns = _build_dsns_from_env()
+        self.pg_table = os.environ.get("PG_TABLE", DEFAULT_TABLE).strip() or DEFAULT_TABLE
+
+        self._pg_conn = None
+        self._pg_dsn_used = None
+
+        # =========================================================================
+        # 【修改点 1】初始化自动重置所需的计时变量
+        # =========================================================================
+        self.last_new_entry_time = time.time()  # 上一次有人加入队列的系统时间
+        self.zero_person_start_time = None      # 连续检测到 0 人的开始时间
+
+        self.load()
+
+    def load(self):
+        """初始化加载"""
+        print("[INFO] 初始化资源...")
+
+        # OCR 离线模型目录
+        ocr_dir = os.path.join(self.base_dir, "easyocr_models")
+        self.ocr_reader = easyocr.Reader(
+            ['en'],
+            gpu=torch.cuda.is_available(),
+            model_storage_directory=ocr_dir,
+            download_enabled=False
+        )
+
+        self.model_entry = YOLO(os.path.join(self.base_dir, MODEL_ENTRY_PATH))
+        self.model_exit  = YOLO(os.path.join(self.base_dir, MODEL_EXIT_PATH))
+
+        self.config_path = os.path.join(self.base_dir, "queue_config_a.json")
+        if not os.path.exists(self.config_path):
+            print(f"[ERROR] 配置文件未找到: {self.config_path}")
+
+        # ===== 新增：如果开启写库，启动时尝试连一次（失败不致命，只报警） =====
+        if self.enable_db_write:
+            try:
+                self._db_get_conn()
+                print(f"[DB   ] connected ok: {self._pg_dsn_used}")
+            except Exception as e:
+                print(f"[DB   ] connect failed (non-fatal, will retry on write): {e}")
+
+    def preprocess(self, dataset: pd.DataFrame) -> pd.DataFrame:
+        return dataset
+
+    def predict(self, data):
+        """
+        24小时常驻运行入口
+        """
+        if data is None:
+            data = {}
+
+        # ===== 新增：允许请求参数动态控制两个开关（优先级高于 env） =====
+        if "enable_db_write" in data:
+            self.enable_db_write = bool(data.get("enable_db_write"))
+        if "enable_csv_write" in data:
+            self.enable_csv_write = bool(data.get("enable_csv_write"))
+
+        print(f"[SWITCH] enable_db_write={self.enable_db_write} | enable_csv_write={self.enable_csv_write}")
+
+        # 允许通过API参数临时覆盖RTSP地址
+        v_in  = data.get("video_entry", RTSP_ENTRY)
+        v_out = data.get("video_exit", RTSP_EXIT)
+
+        # 加载画线配置
+        with open(self.config_path, 'r') as f:
+            cfg = json.load(f)
+            self.region_polygon = np.array(cfg['region_polygon'], np.int32)
+            self.entry_lines = cfg['entry_lines']
+            self.exit_line = cfg['exit_line']
+
+        # 初始化变量
+        self.time_queue = deque()
+        self.entry_hist = {}
+        self.exit_history = {}
+        self.in_queue_set = set()
+        
+        # 重置逻辑变量再次初始化
+        self.last_new_entry_time = time.time()
+        self.zero_person_start_time = None
+
+        # 1. OCR 校准
+        print(f"[INFO] 正在校准时间基准...")
+        self.entry_start_sec = self._ocr_calibration(v_in, "入口")
+        self.exit_start_sec  = self._ocr_calibration(v_out, "出口")
+
+        # 2. 进入死循环处理
+        print(f"[INFO] 启动24小时监控循环...")
+        self._run_forever(v_in, v_out)
+
+        return json.dumps({"status": "stopped"})
+
+    # ====================== 写入逻辑 ======================
+
+    def _get_current_csv_path(self):
+        """获取当天的CSV路径，实现按天自动分割"""
+        date_str = datetime.now().strftime("%Y%m%d")
+        return os.path.join(self.output_dir, f"queue_data_{date_str}.csv")
+
+    # ===== 新增：获取/复用 DB 连接（懒连接+自动重连） =====
+    def _db_get_conn(self):
+        if self._pg_conn is not None:
+            return self._pg_conn
+
+        if not self.pg_dsns:
+            raise RuntimeError("PG DSN not set. Please set env PG_DSN_73/PG_DSN_74/PG_DSN")
+
+        conn, used = _connect_any(self.pg_dsns, timeout=3)
+        self._pg_conn = conn
+        self._pg_dsn_used = used
+        return conn
+
+    def _db_close_conn(self):
+        try:
+            if self._pg_conn is not None:
+                self._pg_conn.close()
+        except Exception:
+            pass
+        self._pg_conn = None
+        self._pg_dsn_used = None
+
+    # ===== 新增：写入一条记录到 security_check_queue =====
+    def _db_insert_record(self, record: dict):
+        """
+        表字段：
+        camera_id, "timestamp", entry_ts, exit_ts, duration_sec
+        uuid 自动生成无需写
+        """
+        # record 内可能是 '时长(秒)'；统一转 duration_sec
+        duration = record.get("duration_sec", None)
+        if duration is None:
+            duration = record.get("时长(秒)", "")
+        # 表里 duration_sec 是 varchar，所以直接 str 存
+        duration_str = "" if duration is None else str(duration)
+
+        sql = f'''
+        INSERT INTO {self.pg_table}
+        (camera_id, "timestamp", entry_ts, exit_ts, duration_sec)
+        VALUES (%s, %s, %s, %s, %s);
+        '''
+
+        params = (
+            str(record.get("camera_id", "")),
+            str(record.get("timestamp", "")),
+            str(record.get("entry_ts", "")),
+            str(record.get("exit_ts", "")),
+            duration_str,
+        )
+
+        # 写库失败不能卡主流程：失败就断开，下次再重连
+        try:
+            conn = self._db_get_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            print(f" [DB   ] inserted duration={duration_str}s")
+        except Exception as e:
+            print(f" [DB   ] insert failed: {e} (will reconnect next time)")
+            self._db_close_conn()
+
+    def _save_record(self, record):
+        """
+        保存数据：
+        1) 写本地 CSV（可开关）
+        2) 写数据库（可开关）
+        3) 可选：推送 webhook（保持原逻辑）
+        """
+        # ---- 1) 写本地 CSV（受开关控制） ----
+        if self.enable_csv_write:
+            try:
+                csv_path = self._get_current_csv_path()
+                df = pd.DataFrame([record])
+
+                if not os.path.exists(csv_path):
+                    df.to_csv(csv_path, index=False, encoding='utf_8_sig')
+                else:
+                    df.to_csv(csv_path, mode='a', header=False, index=False, encoding='utf_8_sig')
+            except Exception as e:
+                print(f"[ERROR] CSV写入失败: {e}")
+        else:
+            print(" [CSV  ] disabled, skip")
+
+        # ---- 2) 写数据库（受开关控制） ----
+        if self.enable_db_write:
+            self._db_insert_record(record)
+        else:
+            print(" [DB   ] disabled, skip")
+
+        # ---- 3) HTTP 推送 (保持原逻辑) ----
+        if WEBHOOK_URL:
+            try:
+                requests.post(WEBHOOK_URL, json=record, timeout=2)
+                print(f" [PUSH] 数据已上报: {record.get('时长(秒)', record.get('duration_sec', ''))}s")
+            except Exception as e:
+                print(f" [WARN] 数据上报失败: {e}")
+
+    # ====================== 主循环 ======================
+
+    def _run_forever(self, p_in, p_out):
+        """具备断线重连能力的死循环"""
+        while True:
+            c1 = cv2.VideoCapture(p_in)
+            c2 = cv2.VideoCapture(p_out)
+
+            if not c1.isOpened() or not c2.isOpened():
+                print("[ERROR] 无法连接RTSP流，10秒后重试...")
+                time.sleep(10)
+                continue
+
+            fps = int(c1.get(cv2.CAP_PROP_FPS)) or 25
+            frame_idx = 0
+
+            print(f"[INFO] 视频流连接成功，开始分析...")
+
+            try:
+                while True:
+                    r1, f1 = c1.read()
+                    r2, f2 = c2.read()
+
+                    if not r1 or not r2:
+                        print("[WARN] 视频流中断，触发重连机制...")
+                        break
+
+                    frame_idx += 1
+                    if frame_idx % PROCESS_INTERVAL != 0:
+                        continue
+
+                    offset = frame_idx / fps
+
+                    self._process_entry(f1, frame_idx, offset)
+                    self._process_exit(f2, offset)
+
+                    if frame_idx % (250 * PROCESS_INTERVAL) == 0:
+                        print(f"[Heartbeat] 运行正常 | 队列中:{len(self.time_queue)}")
+
+            except Exception as e:
+                print(f"[ERROR] 处理循环发生未知错误: {e}")
+            finally:
+                c1.release()
+                c2.release()
+                print("[INFO] 正在清理资源并准备重连...")
+                time.sleep(5)
+
+    def _process_entry(self, frame, frame_idx, offset):
+        res = self.model_entry.track(frame, persist=True, verbose=False, classes=[0], conf=CONF_THRES)
+        
+        # =========================================================================
+        # 【修改点 2】记录当前区域内有多少人
+        # =========================================================================
+        current_region_count = 0 
+
+        if res and res[0].boxes.id is not None:
+            for box, tid in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.id.cpu().numpy()):
+                oid = int(tid)
+                cp = (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
+                
+                # 统计当前在多边形内的人数
+                is_inside = cv2.pointPolygonTest(self.region_polygon, cp, False) >= 0
+                if is_inside:
+                    current_region_count += 1
+
+                if frame_idx <= 50:
+                    if is_inside:
+                        if oid not in self.in_queue_set:
+                            self.time_queue.append(self.entry_start_sec)
+                            self.in_queue_set.add(oid)
+                            # 记录：有新成员加入
+                            self.last_new_entry_time = time.time()
+                else:
+                    if oid not in self.entry_hist:
+                        self.entry_hist[oid] = deque(maxlen=2)
+                    if self.entry_hist[oid]:
+                        for line in self.entry_lines:
+                            if self._intersect(self.entry_hist[oid][-1], cp, tuple(line[0]), tuple(line[1])):
+                                if oid not in self.in_queue_set:
+                                    self.time_queue.append(self.entry_start_sec + offset)
+                                    self.in_queue_set.add(oid)
+                                    # 记录：有新成员加入
+                                    self.last_new_entry_time = time.time()
+                    self.entry_hist[oid].append(cp)
+
+        # =========================================================================
+        # 【修改点 3】核心重置逻辑：满足任一条件即清零
+        # 条件A: 30min无新进 + 连续2秒无人
+        # 条件B: 连续10秒无人 (新增)
+        # =========================================================================
+        now_sys = time.time()
+
+        # 1. 维护“连续无人”计时器
+        if current_region_count == 0:
+            if self.zero_person_start_time is None:
+                self.zero_person_start_time = now_sys
+        else:
+            self.zero_person_start_time = None
+
+        # 只有当队列里还有人（也就是有误差残留）的时候，才需要判断是否清零
+        if len(self.time_queue) > 0:
+            
+            # 计算已经连续空闲了多少秒
+            empty_duration = 0
+            if self.zero_person_start_time is not None:
+                empty_duration = now_sys - self.zero_person_start_time
+
+            # --- 判断条件 ---
+            
+            # 条件 A：30分钟没进人 且 空闲时间 > 2秒
+            cond_a_timeout = (now_sys - self.last_new_entry_time) > 1800
+            cond_a_empty   = empty_duration > 2
+            condition_a = cond_a_timeout and cond_a_empty
+
+            # 条件 B：空闲时间 > 10秒 (新增功能)
+            condition_b = empty_duration > 10
+
+            # --- 执行清零 ---
+            if condition_a or condition_b:
+                if condition_a:
+                    print(f"[RESET] 触发条件A (30min超时+2s空闲)。清除残留队列: {len(self.time_queue)} 人")
+                else:
+                    print(f"[RESET] 触发条件B (连续10s空闲)。清除残留队列: {len(self.time_queue)} 人")
+                
+                self.time_queue.clear()
+                self.in_queue_set.clear()
+                self.entry_hist.clear()
+                
+                # 重置计时器，防止瞬间重复触发
+                self.last_new_entry_time = now_sys
+
+    def _process_exit(self, frame, offset):
+        res = self.model_exit.track(frame, persist=True, verbose=False, classes=[0], conf=CONF_THRES)
+        if res and res[0].boxes.id is not None:
+            for box, tid in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.id.cpu().numpy()):
+                oid = int(tid)
+                cp = (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
+
+                if oid not in self.exit_history:
+                    self.exit_history[oid] = deque(maxlen=2)
+
+                if self.exit_history[oid]:
+                    if self._intersect(self.exit_history[oid][-1], cp, tuple(self.exit_line[0]), tuple(self.exit_line[1])):
+                        if self.time_queue:
+                            ent_t = self.time_queue.popleft()
+                            ext_t = self.exit_start_sec + offset
+                            duration = max(0, ext_t - ent_t)
+
+                            record = {
+                                "camera_id": "CAM_001",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_ts": str(timedelta(seconds=int(ent_t))),
+                                "exit_ts":  str(timedelta(seconds=int(ext_t))),
+                                "duration_sec": str(round(duration, 2)),
+                                "时长(秒)": round(duration, 2),  # 保留旧字段方便日志
+                            }
+
+                            self._save_record(record)
+
+                self.exit_history[oid].append(cp)
+
+    def _ocr_calibration(self, path, label):
+        """带重试机制的 OCR 校准"""
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                return datetime.now().hour * 3600
+
+            candidates = []
+            for i in range(60):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if i % 10 == 0:
+                    roi = frame[0:150, 0:600]
+                    res = self.ocr_reader.readtext(roi)
+                    for (_, text, _) in res:
+                        clean = text.replace(' ', '').replace('o', '0').replace('O', '0').replace('.', ':')
+                        match = re.search(r'(\d{1,2}:\d{2}:\d{2})', clean)
+                        if match:
+                            try:
+                                t_str = match.group(1)
+                                if len(t_str.split(':')[0]) == 1:
+                                    t_str = '0' + t_str
+                                dt = datetime.strptime(t_str, "%H:%M:%S")
+                                candidates.append((dt - timedelta(seconds=i/25.0)).strftime("%H:%M:%S"))
+                            except:
+                                continue
+            cap.release()
+
+            if candidates:
+                final_val = Counter(candidates).most_common(1)[0][0]
+                print(f"[OCR SUCCESS] {label} 时间: {final_val}")
+                t = datetime.strptime(final_val, "%H:%M:%S")
+                return t.hour * 3600 + t.minute * 60 + t.second
+        except Exception as e:
+            print(f"[WARN] OCR出错: {e}")
+
+        now = datetime.now()
+        return now.hour * 3600 + now.minute * 60 + now.second
+
+    def _intersect(self, A, B, C, D):
+        def ccw(A, B, C):
+            return (C[1]-A[1])*(B[0]-A[0]) > (B[1]-A[1])*(C[0]-A[0])
+        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+
+if __name__ == "__main__":
+    m = PyModel()
+    m.predict({})
