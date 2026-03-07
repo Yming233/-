@@ -1,0 +1,72 @@
+import subprocess
+import datetime
+import os
+import sys
+
+# 你的静态 ffmpeg 路径（已验证手工命令可用）
+FFMPEG = "/home/bml/storage/mnt/v-6het41tjjkp1fu5m/org/tools/ffmpeg/ffmpeg"
+
+B_PRE  = "rtsp://172.30.100.37:1562/rtp/100010023"  # B前
+B_POST = "rtsp://172.30.100.37:1562/rtp/100010018"  # B后
+
+DUR = 14400  # seconds, 2h
+OUTDIR = "./captures_B"
+os.makedirs(OUTDIR, exist_ok=True)
+
+ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def run_ffmpeg(url: str, out_path: str, log_path: str):
+    # 注意：先不要加任何 timeout 参数（你当前 build 不支持 -rw_timeout）
+    cmd = [
+        FFMPEG,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-loglevel", "info",
+
+        # RTSP 走 TCP 更稳
+        "-rtsp_transport", "tcp",
+
+        # 输入
+        "-i", url,
+
+        # 录制时长
+        "-t", str(DUR),
+
+        # 只保留视频（避免 pcm_alaw 写 TS 出现“private data stream”导致后续读取异常）
+        "-map", "0:v:0",
+        "-an",
+
+        # 不转码，直接封装拷贝（最快）
+        "-c", "copy",
+
+        out_path,
+    ]
+
+    with open(log_path, "w", encoding="utf-8") as f:
+        return subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+
+
+p1_out = os.path.join(OUTDIR, f"B前_{ts_now}.ts")
+p2_out = os.path.join(OUTDIR, f"B后_{ts_now}.ts")
+p1_log = os.path.join(OUTDIR, f"B前_{ts_now}.log")
+p2_log = os.path.join(OUTDIR, f"B后_{ts_now}.log")
+
+# 基础检查
+if not os.path.exists(FFMPEG):
+    print(f"[FATAL] ffmpeg not found: {FFMPEG}", file=sys.stderr)
+    sys.exit(2)
+
+# 启动两路录制
+p1 = run_ffmpeg(B_PRE,  p1_out, p1_log)
+p2 = run_ffmpeg(B_POST, p2_out, p2_log)
+
+print(f"[INFO] started: pid1={p1.pid}, pid2={p2.pid}")
+rc1 = p1.wait()
+rc2 = p2.wait()
+print(f"[INFO] done: rc1={rc1} rc2={rc2}")
+print(f"[INFO] outputs: {p1_out}, {p2_out}")
+
+if rc1 != 0 or rc2 != 0:
+    print("[WARN] ffmpeg returned non-zero. Check logs:", p1_log, p2_log, file=sys.stderr)
